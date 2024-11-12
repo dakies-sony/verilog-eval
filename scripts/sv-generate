@@ -31,11 +31,12 @@ import time
 from collections import namedtuple
 
 
-from langchain_nvidia_ai_endpoints import ChatNVIDIA
-from langchain_openai import ChatOpenAI
+from langchain_community.llms import VLLM
+import torch
 from langchain.schema   import SystemMessage, HumanMessage
-from langchain.callbacks import get_openai_callback
-
+from langchain_community.callbacks.manager import get_openai_callback
+from vllm.lora.request import LoRARequest
+    
 #-------------------------------------------------------------------------
 # Command line processing
 #-------------------------------------------------------------------------
@@ -44,7 +45,8 @@ class ArgumentParserWithCustomError(argparse.ArgumentParser):
   def error( self, msg = "" ):
     if ( msg ): print("\n ERROR: %s" % msg)
     print("")
-    file = open( sys.argv[0] )
+    file = open(sys.argv[0])
+    os.chmod(sys.argv[0], 0o777)
     for ( lineno, line ) in enumerate( file ):
       if ( line[0] != '#' ): sys.exit(msg != "")
       if ( (lineno == 2) or (lineno >= 4) ): print( line[1:].rstrip("\n") )
@@ -64,6 +66,7 @@ def parse_cmdline():
   p.add_argument( "-r", "--rules",       action="store_true" )
   p.add_argument(       "--output",      type=str,   default="-" )
   p.add_argument(       "--task",        type=str,   default="code-complete-iccad2023" )
+  p.add_argument( "-a", "--lora",        type=str,   default=None )
   p.add_argument( "prompt_filename" )
 
   opts = p.parse_args()
@@ -73,29 +76,14 @@ def parse_cmdline():
 #-------------------------------------------------------------------------
 # Models
 #-------------------------------------------------------------------------
-
 openai_models = [
-  "gpt-3.5-turbo",
-  "gpt-4",
-  "gpt-4-turbo",
+#   "gpt-3.5-turbo",
+#   "gpt-4",
+#   "gpt-4-turbo",
 ]
 
-nim_chat_models = [
-  "ai-llama2-70b",
-  "ai-llama3-70b",
-  "meta/llama-3.1-8b-instruct",
-  "meta/llama-3.1-70b-instruct",
-  "meta/llama-3.1-405b-instruct",
-  "ai-codellama-70b",
-  "ai-gemma-7b",
-  "ai-codegemma-7b",
-  "ai-mistral-7b-instruct-v2",
-  "ai-mixtral-8x7b-instruct",
-  "ai-mistral-large"
-]
-
-manual_models = [
-  'manual-rtl-coder'
+hf_chat_models = [
+  "meta-llama/Llama-3.1-8B-Instruct",
 ]
 
 model_aliases = {
@@ -104,11 +92,11 @@ model_aliases = {
   "gpt4-turbo"   : "gpt-4-turbo",
   "ai-llama-3_1-8b-instruct": "meta/llama-3.1-8b-instruct",
   "ai-llama-3_1-70b-instruct": "meta/llama-3.1-70b-instruct",
-  "ai-llama-3_1-405b-instruct": "meta/llama-3.1-405b-instruct"
+  "ai-llama-3_1-405b-instruct": "meta/llama-3.1-405b-instruct",
 }
 
 models_to_repeat_system_to_human_messages = [
-  "ai-mistral-large"
+#   "ai-mistral-large"
 ]
 
 available_tasks = [
@@ -203,44 +191,10 @@ def main():
 
   # Check models
 
-  if opts.list_models:
-    print( "" )
-    print( "OpenAI Models" )
-
-    for model in openai_models:
-      print( f" - {model}" )
-
-    print( "" )
-    print( "NIM Models" )
-
-    for model in nim_chat_models:
-      print( f" - {model}" )
-
-    print( "" )
-    print( "Manual Models" )
-
-    for model in manual_models:
-      print( f" - {model}" )
-
-
-    print( "" )
-    print( "Model Aliases" )
-
-    for key,value in model_aliases.items():
-      print( f" - {key} : {value}" )
-
-    print( "" )
-    return
-
   model = opts.model
   if opts.model in model_aliases:
     model = model_aliases[opts.model]
 
-  if model not in openai_models + nim_chat_models + manual_models:
-    print("")
-    print(f"ERROR: Unknown model {model}")
-    print("")
-    return
 
   task = opts.task
   if task not in available_tasks:
@@ -339,61 +293,36 @@ def main():
   out.print(full_prompt.rstrip())
 
   file = open( opts.output, 'w' )
+  os.chmod(opts.output, 0o777)
   print( "", file=file )
 
   # Create LLM messages
 
   msgs = [ SystemMessage(system_msg), HumanMessage(full_prompt) ]
 
-  # Query the LLM
 
-  if model in openai_models:
-    llm = ChatOpenAI(
-      model       = model,
-      temperature = temperature,
-      top_p       = top_p,
-      max_tokens  = max_tokens,
-    )
-  elif model in nim_chat_models:
-    llm = ChatNVIDIA(
-      model       = model,
-      temperature = temperature,
-      top_p       = top_p,
-      max_tokens  = max_tokens,
-    )
-  elif model in manual_models:
-    output_prompt_filename, junk_ext = os.path.splitext(opts.output)
-    with open( output_prompt_filename + "_fullprompt.txt", 'w' ) as output_prompt_file:
-      print( full_prompt.rstrip(), file=output_prompt_file )
-    with open( output_prompt_filename + "_systemprompt.txt", 'w' ) as output_prompt_file:
-      print( system_msg, file=output_prompt_file )
-  else:
-    # should never reach here
-    return
+    
+  llm = VLLM(
+      model=model,
+      trust_remote_code=True,  # mandatory for hf models
+      max_new_tokens=2048,
+      top_p=top_p,
+      temperature=temperature,
+      enable_lora= True if opts.lora else False,
+  )
 
-  if model not in manual_models:
-    for _ in range(10):
-      try:
-        with get_openai_callback() as cb:
-          resp = llm.invoke(msgs)
-          break
-      except Exception as e:
-        print("")
-        print("ERROR: LLM query failed, retrying in 20 seconds")
-        print(f"{type(e)}")
-        print(f"{e}")
-        print("")
-        time.sleep(20)
-  else:
-    output_prompt_filename, junk_ext = os.path.splitext(opts.output)
-    input_response_filename = output_prompt_filename + "_response.txt"
-    # if exists
-    if os.path.exists(input_response_filename):
-      with open( input_response_filename) as input_response_file:
-        resp = namedtuple('Response', ['content'])(content=input_response_file.read())
-    else:
-      resp = namedtuple('Response', ['content'])(content="// Manually run")
-    cb = namedtuple('Callback', ['prompt_tokens', 'resp_tokens', 'total_tokens', 'total_cost', 'completion_tokens'])(prompt_tokens=0, resp_tokens=0, total_tokens=0, total_cost=0, completion_tokens=0)
+  for _ in range(10):
+    try:
+      with get_openai_callback() as cb:
+        resp = llm.invoke(msgs, lora_request=lora_adapter if opts.lora else None)
+        break
+    except Exception as e:
+      print("")
+      print("ERROR: LLM query failed, retrying in 20 seconds")
+      print(f"{type(e)}")
+      print(f"{e}")
+      print("")
+      time.sleep(20)
 
   # Display the response
 
@@ -402,7 +331,7 @@ def main():
   out.print("-"*74)
 
   out.print("")
-  print(resp.content)
+  print(resp)
   out.print("")
 
   # Display statistics
@@ -420,6 +349,7 @@ def main():
 
   # Extract code from response
   file = open( opts.output, 'w' )
+  os.chmod(opts.output, 0o777)
   print( "", file=file )
 
   if task == "code-complete-iccad2023":
@@ -427,7 +357,7 @@ def main():
     backticks_count  = 0
     endmodule_before_startmodule = False
     module_already_exists = False
-    for line in iter(resp.content.splitlines()):
+    for line in iter(resp.splitlines()):
       if line.startswith("```"):
         backticks_count += 1
       elif line.startswith("endmodule"):
@@ -455,7 +385,7 @@ def main():
     found_module           = False
     found_endmodule        = False
 
-    for line in iter(resp.content.splitlines()):
+    for line in iter(resp.splitlines()):
       echo_line = True
 
       if line.strip().startswith("module TopModule"): # now we monitor if we've found it but we don't do anything with it.
@@ -505,7 +435,7 @@ def main():
     backticks_count  = 0
     endmodule_before_startmodule = False
     module_already_exists = False
-    for line in iter(resp.content.splitlines()):
+    for line in iter(resp.splitlines()):
       if line.startswith("```"):
         backticks_count += 1
       elif line.startswith("endmodule"):
@@ -524,7 +454,7 @@ def main():
     found_code_start = False
     found_code_end   = False
 
-    for line in iter(resp.content.splitlines()):
+    for line in iter(resp.splitlines()):
 
       # if not found_code_start:
       #   if line.strip() == "<CODE>":
@@ -575,7 +505,7 @@ def main():
       found_module           = False
       found_endmodule        = False
 
-      for line in iter(resp.content.splitlines()):
+      for line in iter(resp.splitlines()):
         echo_line = True
 
         if line.strip().startswith("module TopModule"): # now we monitor if we've found it but we don't do anything with it.
@@ -611,7 +541,7 @@ def main():
       # found_code_start = False
       # found_code_end   = False
 
-      # for line in iter(resp.content.splitlines()):
+      # for line in iter(resp.splitlines()):
 
       #   if not found_code_start:
       #     if line.lstrip().startswith("```"):
@@ -639,5 +569,8 @@ def main():
   print( "", file=file )
 
   file.close()
+  del llm
+  gc.collect()
+  torch.cuda.empty_cache()
 
 main()

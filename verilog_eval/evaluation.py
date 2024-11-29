@@ -1,13 +1,60 @@
 from collections import defaultdict, Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import List, Union, Iterable, Dict, Tuple, Optional
+from typing import List, Union, Dict, Tuple, Optional
 import itertools
+import re
 
 import numpy as np
 import tqdm
 
 from verilog_eval.data import read_problems, stream_jsonl, write_jsonl
 from verilog_eval.execution import check_correctness, clean_up_simulation
+
+## Added by Daniel
+def clean_code_snippet(input_text):
+    # Remove any leading backticks and text before the first triple backtick
+    cleaned_text = re.sub(r'^.*?```', '', input_text, count=1, flags=re.DOTALL)
+    return cleaned_text
+
+def extract_verilog_module(code):
+
+    code = clean_code_snippet(code)
+    # Define the regex patterns to find the desired positions
+    top_module_pattern = re.compile(r'\bmodule\s+top_module\b')
+    module_pattern = re.compile(r'\bmodule\s+(\w+)\s*\(')
+    endmodule_pattern = re.compile(r'\bendmodule\b')
+
+    top_module_match = top_module_pattern.search(code)
+    # Find the position of "module top_module"
+    if not top_module_match:
+        module_match = module_pattern.search(code)
+        if not module_match:
+            start_pos = 0
+        else:
+            start_pos = module_match.start()  # Start of the substring "module top_module"
+            tmp_code = code[start_pos :]
+            semicolon_index = tmp_code.find(";")
+            if semicolon_index != -1 :
+                start_pos = start_pos + semicolon_index + 1
+    else:
+        start_pos = top_module_match.start()  # Start of the substring "module top_module"
+        tmp_code = code[start_pos :]
+        semicolon_index = tmp_code.find(";")
+        if semicolon_index != -1 :
+            start_pos = start_pos + semicolon_index + 1
+
+    # Find the position of the last "endmodule"
+    end_pos = -1
+    for match in endmodule_pattern.finditer(code):
+        end_pos = match.end()
+
+    if end_pos == -1:
+        return code  # If "endmodule" is not found, return original string
+
+    # Extract the relevant portion of the code
+    extracted_code = code[start_pos:end_pos]
+    return extracted_code
+#### End of Daniel's code
 
 
 def estimate_pass_at_k(
@@ -67,7 +114,7 @@ def contain_passing_completion(
 def evaluate_functional_correctness(
     sample_file: str,
     problem_file: str,
-    k: List[int] = [1, 10, 100],
+    k: List[int] = None,
     n_workers: int = 4,
     timeout: float = 30.0,
     unit_test: bool = False,
@@ -78,6 +125,8 @@ def evaluate_functional_correctness(
     results to f"{sample_file}_results.jsonl.gz"
     """
 
+    if k is None:
+        k = [1, 10, 100]
     problems = read_problems(problem_file)
 
     # Check the generated samples against test suites.
@@ -91,6 +140,7 @@ def evaluate_functional_correctness(
         print("Reading samples...")
         for sample in tqdm.tqdm(stream_jsonl(sample_file)):
             task_id = sample["task_id"]
+            # completion = extract_verilog_module(sample["completion"]) # Daniel's code
             completion = sample["completion"]
             if unit_test:
                 args = (problems[task_id], completion, timeout, completion_id[task_id], 100)
